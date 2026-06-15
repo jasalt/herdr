@@ -15,7 +15,10 @@ use crate::api::schema::{
 };
 use crate::api::subscriptions::ActiveSubscription;
 use crate::api::wait::wait_for_output;
-use crate::api::{request_changes_ui, socket_path, ApiRequestMessage, ApiRequestSender, EventHub};
+use crate::api::{
+    is_agent_state_change_method_name, request_changes_ui, socket_path, ApiRequestMessage,
+    ApiRequestSender, EventHub,
+};
 use crate::ipc::{
     bind_local_listener, remove_socket_file_if_owned, socket_file_identity, LocalStream,
     SocketFileIdentity,
@@ -56,6 +59,7 @@ impl ServerHandle {
 pub fn start_server(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
+    socket_password: Option<String>,
 ) -> std::io::Result<ServerHandle> {
     start_server_with_capabilities(
         api_tx,
@@ -63,6 +67,7 @@ pub fn start_server(
         Some(ServerCapabilities {
             live_handoff: crate::platform::capabilities().live_handoff,
         }),
+        socket_password,
     )
 }
 
@@ -70,6 +75,7 @@ pub fn start_server_with_capabilities(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
     capabilities: Option<ServerCapabilities>,
+    socket_password: Option<String>,
 ) -> std::io::Result<ServerHandle> {
     let path = socket_path();
     prepare_socket_path(&path)?;
@@ -77,7 +83,11 @@ pub fn start_server_with_capabilities(
     let listener = bind_local_listener(&path)?;
     restrict_socket_permissions(&path)?;
     let identity = socket_file_identity(&path)?;
-    info!(path = %path.display(), "api server listening");
+    if socket_password.is_some() {
+        info!(path = %path.display(), "api server listening (password protected)");
+    } else {
+        info!(path = %path.display(), "api server listening");
+    }
 
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
@@ -89,6 +99,7 @@ pub fn start_server_with_capabilities(
                     let event_hub = event_hub.clone();
                     let capabilities = capabilities.clone();
                     let connection_running = Arc::clone(&listener_running);
+                    let socket_password = socket_password.clone();
                     std::thread::spawn(move || {
                         if let Err(err) = handle_connection(
                             stream,
@@ -96,6 +107,7 @@ pub fn start_server_with_capabilities(
                             &event_hub,
                             &connection_running,
                             capabilities,
+                            socket_password,
                         ) {
                             warn!(err = %err, "api connection failed");
                         }
@@ -137,6 +149,7 @@ fn handle_connection(
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
+    socket_password: Option<String>,
 ) -> std::io::Result<()> {
     if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
         debug!(err = %err, "api connection write timeout unavailable");
@@ -151,7 +164,58 @@ fn handle_connection(
         return Ok(());
     }
 
-    let request = match serde_json::from_str::<Request>(line) {
+    let raw_value: serde_json::Value = match serde_json::from_str(line) {
+        Ok(value) => value,
+        Err(err) => {
+            write_json_line_allow_disconnect(
+                &mut stream,
+                &ErrorResponse {
+                    id: String::new(),
+                    error: ErrorBody {
+                        code: "invalid_request".into(),
+                        message: format!("invalid request: {err}"),
+                    },
+                },
+            )?;
+            return Ok(());
+        }
+    };
+
+    let request_id = raw_value
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let method_name = raw_value
+        .get("method")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // When a password is configured, non-agent-state-change methods must include
+    // the correct password in the JSON-RPC payload.
+    if let Some(ref expected_password) = socket_password {
+        if !is_agent_state_change_method_name(method_name) {
+            let provided_password = raw_value
+                .get("password")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if provided_password != expected_password {
+                write_json_line_allow_disconnect(
+                    &mut stream,
+                    &ErrorResponse {
+                        id: request_id,
+                        error: ErrorBody {
+                            code: "unauthorized".into(),
+                            message: "invalid or missing socket password".into(),
+                        },
+                    },
+                )?;
+                return Ok(());
+            }
+        }
+    }
+
+    let request: Request = match serde_json::from_value(raw_value) {
         Ok(request) => request,
         Err(err) => {
             write_json_line_allow_disconnect(
@@ -821,7 +885,8 @@ mod tests {
         let event_hub = EventHub::default();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server_thread = std::thread::spawn(move || {
-            let result = handle_connection(server, &api_tx, &event_hub, &server_running, None);
+            let result =
+                handle_connection(server, &api_tx, &event_hub, &server_running, None, None);
             done_tx.send(result).unwrap();
         });
 
@@ -853,7 +918,8 @@ mod tests {
         let event_hub = EventHub::default();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server_thread = std::thread::spawn(move || {
-            let result = handle_connection(server, &api_tx, &event_hub, &server_running, None);
+            let result =
+                handle_connection(server, &api_tx, &event_hub, &server_running, None, None);
             done_tx.send(result).unwrap();
         });
 
@@ -885,7 +951,8 @@ mod tests {
         let event_hub = EventHub::default();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server_thread = std::thread::spawn(move || {
-            let result = handle_connection(server, &api_tx, &event_hub, &server_running, None);
+            let result =
+                handle_connection(server, &api_tx, &event_hub, &server_running, None, None);
             done_tx.send(result).unwrap();
         });
 
@@ -895,6 +962,182 @@ mod tests {
 
         running.store(false, Ordering::Relaxed);
 
+        let result = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(result.is_ok());
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn password_required_rejects_missing_password_for_non_agent_state_change() {
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (mut client, server, _path) = local_stream_pair("api-pw-reject");
+        client
+            .write_all(br#"{"id":"req_1","method":"ping","params":{}}"#)
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::clone(&running);
+        let event_hub = EventHub::default();
+        let password = Some("secret".to_string());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let server_thread = std::thread::spawn(move || {
+            let result =
+                handle_connection(server, &api_tx, &event_hub, &server_running, None, password);
+            done_tx.send(result).unwrap();
+        });
+
+        let response = read_line(&mut client);
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["error"]["code"], "unauthorized");
+        assert_eq!(
+            response["error"]["message"],
+            "invalid or missing socket password"
+        );
+
+        drop(client);
+        let result = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(result.is_ok());
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn password_required_accepts_correct_password() {
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (mut client, server, _path) = local_stream_pair("api-pw-accept");
+        client
+            .write_all(br#"{"id":"req_1","password":"secret","method":"ping","params":{}}"#)
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::clone(&running);
+        let event_hub = EventHub::default();
+        let password = Some("secret".to_string());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let server_thread = std::thread::spawn(move || {
+            let result =
+                handle_connection(server, &api_tx, &event_hub, &server_running, None, password);
+            done_tx.send(result).unwrap();
+        });
+
+        let response = read_line(&mut client);
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "pong");
+
+        drop(client);
+        let _msg = api_rx.try_recv();
+        let result = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(result.is_ok());
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn password_required_allows_agent_state_change_without_password() {
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (mut client, server, _path) = local_stream_pair("api-pw-agent");
+        client
+            .write_all(
+                br#"{"id":"req_1","method":"pane.report_agent","params":{"pane_id":"p1","source":"test","agent":"test","state":"working","seq":1}}"#,
+            )
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::clone(&running);
+        let event_hub = EventHub::default();
+        let password = Some("secret".to_string());
+        let responder = std::thread::spawn(move || {
+            while let Some(msg) = api_rx.blocking_recv() {
+                msg.respond_to
+                    .send(
+                        serde_json::to_string(&SuccessResponse {
+                            id: msg.request.id,
+                            result: ResponseResult::Ok {},
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap();
+            }
+        });
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let server_thread = std::thread::spawn(move || {
+            let result =
+                handle_connection(server, &api_tx, &event_hub, &server_running, None, password);
+            done_tx.send(result).unwrap();
+        });
+
+        let response = read_line(&mut client);
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "ok");
+
+        drop(client);
+        let result = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(result.is_ok());
+        server_thread.join().unwrap();
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn password_required_rejects_wrong_password() {
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (mut client, server, _path) = local_stream_pair("api-pw-wrong");
+        client
+            .write_all(br#"{"id":"req_1","password":"wrong","method":"ping","params":{}}"#)
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::clone(&running);
+        let event_hub = EventHub::default();
+        let password = Some("secret".to_string());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let server_thread = std::thread::spawn(move || {
+            let result =
+                handle_connection(server, &api_tx, &event_hub, &server_running, None, password);
+            done_tx.send(result).unwrap();
+        });
+
+        let response = read_line(&mut client);
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["error"]["code"], "unauthorized");
+
+        drop(client);
+        let result = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(result.is_ok());
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn no_password_configured_allows_all_requests() {
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (mut client, server, _path) = local_stream_pair("api-no-pw");
+        client
+            .write_all(br#"{"id":"req_1","method":"ping","params":{}}"#)
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::clone(&running);
+        let event_hub = EventHub::default();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let server_thread = std::thread::spawn(move || {
+            let result =
+                handle_connection(server, &api_tx, &event_hub, &server_running, None, None);
+            done_tx.send(result).unwrap();
+        });
+
+        let response = read_line(&mut client);
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "pong");
+
+        drop(client);
+        let _msg = api_rx.try_recv();
         let result = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(result.is_ok());
         server_thread.join().unwrap();

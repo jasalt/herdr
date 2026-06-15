@@ -219,6 +219,8 @@ pub struct HeadlessServer {
     effective_size: (u16, u16),
     /// Flag set when shutdown is initiated.
     shutting_down: bool,
+    /// Password for protecting the JSON-RPC API socket.
+    socket_password: Option<String>,
     /// Flag set while exporting live PTYs to a replacement server.
     handoff_in_progress: bool,
     /// Imported panes get one app-safe resize nudge after the first client attaches.
@@ -362,6 +364,7 @@ impl HeadlessServer {
         config_diagnostics: &[String],
         api_tx: Option<api::ApiRequestSender>,
         api_server: Option<api::ServerHandle>,
+        socket_password: Option<String>,
     ) -> io::Result<Self> {
         let client_path = client_socket_path();
         prepare_socket_path(&client_path)?;
@@ -409,6 +412,7 @@ impl HeadlessServer {
             next_activity_stamp: 1,
             effective_size: (MIN_COLS, MIN_ROWS),
             shutting_down: false,
+            socket_password,
             handoff_in_progress: false,
             #[cfg(unix)]
             pending_handoff_repaint_nudge: false,
@@ -1037,7 +1041,11 @@ impl HeadlessServer {
             .api_tx
             .clone()
             .ok_or_else(|| io::Error::other("cannot restore api socket without api sender"))?;
-        let api_server = api::start_server(api_tx, self.app.event_hub.clone())?;
+        let api_server = api::start_server(
+            api_tx,
+            self.app.event_hub.clone(),
+            self.socket_password.clone(),
+        )?;
 
         let client_path = client_socket_path();
         prepare_socket_path(&client_path)?;
@@ -3626,7 +3634,7 @@ fn is_keybinding_config_diagnostic(diagnostic: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Run the headless server. This is the entry point called from main.rs.
-pub fn run_server() -> io::Result<()> {
+pub fn run_server(socket_password: Option<String>) -> io::Result<()> {
     init_logging();
     crate::platform::raise_server_nofile_limit();
 
@@ -3639,7 +3647,7 @@ pub fn run_server() -> io::Result<()> {
         let token = args
             .get(4)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing handoff token"))?;
-        return run_handoff_import_server(&socket_path, token);
+        return run_handoff_import_server(&socket_path, token, socket_password);
     }
 
     let loaded_config = config::Config::load();
@@ -3647,7 +3655,7 @@ pub fn run_server() -> io::Result<()> {
     let event_hub = api::EventHub::default();
 
     // Start the JSON API socket server.
-    let _api_server = match api::start_server(api_tx.clone(), event_hub.clone()) {
+    let _api_server = match api::start_server(api_tx.clone(), event_hub.clone(), socket_password.clone()) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
             eprintln!("error: herdr server is already running");
@@ -3687,6 +3695,7 @@ pub fn run_server() -> io::Result<()> {
             &loaded_config.diagnostics,
             Some(api_tx.clone()),
             Some(_api_server),
+            socket_password,
         ) {
             Ok(server) => server,
             Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
@@ -3743,7 +3752,11 @@ fn take_startup_cwd() -> Option<PathBuf> {
 }
 
 #[cfg(unix)]
-fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> {
+fn run_handoff_import_server(
+    socket_path: &Path,
+    token: &str,
+    socket_password: Option<String>,
+) -> io::Result<()> {
     let loaded_config = config::Config::load();
     let mut received = crate::server::handoff::receive(socket_path, token)?;
     crate::server::handoff::log_import_result(received.manifest.panes.len());
@@ -3787,12 +3800,14 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         }
         wait_for_old_public_sockets_to_close(Duration::from_secs(5))?;
 
-        let api_server = api::start_server(api_tx.clone(), event_hub.clone())?;
+        let api_server =
+            api::start_server(api_tx.clone(), event_hub.clone(), socket_password.clone())?;
         let mut server = HeadlessServer::new(
             app,
             &loaded_config.diagnostics,
             Some(api_tx.clone()),
             Some(api_server),
+            socket_password,
         )?;
         crate::server::handoff::report_ready(&mut received.stream)?;
         crate::server::handoff::wait_committed(&mut received.stream)?;
@@ -3833,7 +3848,7 @@ fn wait_for_old_public_sockets_to_close(timeout: Duration) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn run_handoff_import_server(_socket_path: &Path, _token: &str) -> io::Result<()> {
+fn run_handoff_import_server(_socket_path: &Path, _token: &str, _socket_password: Option<String>) -> io::Result<()> {
     Err(io::Error::other("live handoff is only supported on Unix"))
 }
 
@@ -3919,6 +3934,7 @@ mod tests {
             next_activity_stamp: 1,
             effective_size: (MIN_COLS, MIN_ROWS),
             shutting_down: false,
+            socket_password: None,
             handoff_in_progress: false,
             #[cfg(unix)]
             pending_handoff_repaint_nudge: false,

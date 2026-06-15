@@ -17,6 +17,18 @@ use tokio::sync::mpsc;
 use crate::api::schema::{Method, Request};
 
 pub const SOCKET_PATH_ENV_VAR: &str = "HERDR_SOCKET_PATH";
+pub const SOCKET_PASSWORD_ENV_VAR: &str = "HERDR_SOCKET_PASSWORD";
+
+pub(crate) fn is_agent_state_change_method_name(method: &str) -> bool {
+    matches!(
+        method,
+        "pane.report_agent"
+            | "pane.report_agent_session"
+            | "pane.report_metadata"
+            | "pane.clear_agent_authority"
+            | "pane.release_agent"
+    )
+}
 
 pub(crate) fn request_changes_ui(request: &Request) -> bool {
     matches!(

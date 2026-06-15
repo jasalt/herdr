@@ -63,6 +63,11 @@ function request(method, params) {
     },
   };
 
+  const socketPassword = process.env.HERDR_SOCKET_PASSWORD;
+  if (socketPassword) {
+    request.password = socketPassword;
+  }
+
   return new Promise((resolve) => {
     const client = net.createConnection(socketPath, () => {
       client.write(`${JSON.stringify(request)}\n`);

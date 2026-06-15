@@ -205,7 +205,15 @@ impl From<serde_json::Error> for ApiClientError {
 }
 
 fn write_request(stream: &mut LocalStream, request: &Request) -> Result<(), ApiClientError> {
-    stream.write_all(serde_json::to_string(request)?.as_bytes())?;
+    let mut value = serde_json::to_value(request)?;
+    if let Ok(password) = std::env::var(crate::api::SOCKET_PASSWORD_ENV_VAR) {
+        if !password.is_empty() && value.get("password").is_none() {
+            if let serde_json::Value::Object(ref mut map) = value {
+                map.insert("password".to_string(), serde_json::Value::String(password));
+            }
+        }
+    }
+    stream.write_all(serde_json::to_string(&value)?.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
     Ok(())

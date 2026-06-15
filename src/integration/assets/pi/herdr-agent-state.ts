@@ -30,6 +30,11 @@ function sendRequest(request: unknown): Promise<void> {
       resolve();
     };
 
+    const socketPassword = process.env.HERDR_SOCKET_PASSWORD;
+    if (socketPassword) {
+      (request as any).password = socketPassword;
+    }
+
     const socket = createConnection(socketPath!);
     socket.on("error", finish);
     socket.on("connect", () => socket.write(`${JSON.stringify(request)}\n`));

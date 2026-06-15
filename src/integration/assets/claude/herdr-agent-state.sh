@@ -84,6 +84,10 @@ if agent_session_id:
 else:
     raise SystemExit(0)
 
+socket_password = os.environ.get("HERDR_SOCKET_PASSWORD", "").strip()
+if socket_password:
+    request["password"] = socket_password
+
 try:
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.settimeout(0.5)

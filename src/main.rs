@@ -364,8 +364,37 @@ fn exit_if_nested_disabled(config: &config::Config) {
     }
 }
 
+fn extract_socket_password(args: &[String]) -> (Vec<String>, Option<String>) {
+    let mut remaining = Vec::with_capacity(args.len());
+    let mut i = 0;
+    let mut password = None;
+    while i < args.len() {
+        if args[i] == "--socket-password" {
+            if let Some(value) = args.get(i + 1) {
+                password = Some(value.clone());
+                i += 2;
+                continue;
+            }
+        } else if let Some(value) = args[i].strip_prefix("--socket-password=") {
+            password = Some(value.to_string());
+            i += 1;
+            continue;
+        }
+        remaining.push(args[i].clone());
+        i += 1;
+    }
+    (remaining, password)
+}
+
 fn main() -> io::Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
+    let (raw_args, cli_password) = extract_socket_password(&raw_args);
+    if let Some(ref password) = cli_password {
+        std::env::set_var(crate::api::SOCKET_PASSWORD_ENV_VAR, password);
+    }
+    let socket_password = std::env::var(crate::api::SOCKET_PASSWORD_ENV_VAR)
+        .ok()
+        .filter(|v| !v.is_empty());
     let args = match session::configure_from_args(&raw_args) {
         Ok(args) => args,
         Err(err) => {
@@ -407,7 +436,7 @@ fn main() -> io::Result<()> {
     }
 
     if args.get(1).map(|s| s.as_str()) == Some("server") {
-        return server::headless::run_server();
+        return server::headless::run_server(socket_password);
     }
 
     // Hidden client mode: connect to an existing server's client socket.
@@ -540,6 +569,8 @@ fn main() -> io::Result<()> {
         println!("  --remote <target>   Attach through SSH to a remote Herdr server");
         println!("  --remote-keybindings <local|server>");
         println!("                      Keybindings for --remote app attach (default: local)");
+        println!("  --socket-password <password>");
+        println!("                      Password-protect the unsafe socket JSON-RPC API");
         println!("  --handoff           Opt into live handoff for update or remote attach");
         println!("  --default-config    Print default configuration and exit");
         println!("  --version, -V       Print version and exit");
@@ -548,6 +579,7 @@ fn main() -> io::Result<()> {
         println!("Config: {}", config::config_path().display());
         println!("Logs:   {}", logging::help_log_paths_summary());
         println!("Env:    HERDR_CONFIG_PATH overrides config file path");
+        println!("        HERDR_SOCKET_PASSWORD protects the socket JSON-RPC API");
         println!("Home:   https://herdr.dev");
         return Ok(());
     }
@@ -568,6 +600,7 @@ fn main() -> io::Result<()> {
         "--session",
         "--remote",
         "--remote-keybindings",
+        "--socket-password",
         "--version",
         "-V",
         "--default-config",
@@ -631,15 +664,17 @@ fn main() -> io::Result<()> {
 
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub = api::EventHub::default();
-    let _api_server = match api::start_server_with_capabilities(api_tx, event_hub.clone(), None) {
-        Ok(server) => server,
-        Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-            eprintln!("error: herdr is already running");
-            eprintln!("socket: {}", api::socket_path().display());
-            std::process::exit(1);
-        }
-        Err(err) => return Err(err),
-    };
+    let _api_server =
+        match api::start_server_with_capabilities(api_tx, event_hub.clone(), None, socket_password)
+        {
+            Ok(server) => server,
+            Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
+                eprintln!("error: herdr is already running");
+                eprintln!("socket: {}", api::socket_path().display());
+                std::process::exit(1);
+            }
+            Err(err) => return Err(err),
+        };
 
     let modify_other_keys_mode = crate::input::host_modify_other_keys_mode(
         std::env::var("TMUX").is_ok(),
