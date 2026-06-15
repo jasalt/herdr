@@ -151,7 +151,7 @@ fn validate_remote_target(target: &str) -> Result<&str, String> {
     Ok(target)
 }
 
-pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
+pub(crate) fn run_remote(remote: RemoteLaunch, socket_password: Option<String>) -> io::Result<()> {
     let session_name = crate::session::active_name()
         .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_string());
     let local_socket = local_forward_socket_path(&remote.target, &session_name);
@@ -165,13 +165,18 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         remote.keybindings,
         remote.live_handoff,
     );
-    let prepared_remote = prepare_remote_herdr(&remote.target, remote.live_handoff)?;
+    let prepared_remote = prepare_remote_herdr(
+        &remote.target,
+        remote.live_handoff,
+        socket_password.as_deref(),
+    )?;
     ensure_remote_server_ready(
         &remote.target,
         &prepared_remote.remote_herdr,
         prepared_remote.installed_or_replaced,
         prepared_remote.stop_after_install_approved,
         remote.live_handoff,
+        socket_password.as_deref(),
     )?;
 
     let manage_ssh_config = crate::config::Config::load()
@@ -184,6 +189,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         local_socket.clone(),
         session_name,
         manage_ssh_config,
+        socket_password,
     )?;
 
     run_client_process(&local_socket, &reattach_command, remote.keybindings)
@@ -455,6 +461,7 @@ impl InstallSource {
 fn prepare_remote_herdr(
     target: &str,
     live_handoff_enabled: bool,
+    socket_password: Option<&str>,
 ) -> io::Result<PreparedRemoteHerdr> {
     let platform = detect_remote_platform(target)?;
     let remote_herdr = RemoteHerdr::for_platform(platform);
@@ -464,7 +471,7 @@ fn prepare_remote_herdr(
     if override_binary.is_none() {
         if let Some(path_remote_herdr) = path_remote_herdr
             .as_ref()
-            .filter(|candidate| remote_binary_matches(target, candidate).unwrap_or(false))
+            .filter(|candidate| remote_binary_matches(target, candidate, socket_password).unwrap_or(false))
         {
             return Ok(PreparedRemoteHerdr {
                 remote_herdr: path_remote_herdr.clone(),
@@ -472,7 +479,7 @@ fn prepare_remote_herdr(
                 stop_after_install_approved: false,
             });
         }
-        if remote_binary_matches(target, &remote_herdr)? {
+        if remote_binary_matches(target, &remote_herdr, socket_password)? {
             return Ok(PreparedRemoteHerdr {
                 remote_herdr,
                 installed_or_replaced: false,
@@ -491,6 +498,7 @@ fn prepare_remote_herdr(
             target,
             status_probe_herdr,
             live_handoff_enabled,
+            socket_password,
         )?;
     }
     confirm_remote_install(
@@ -503,7 +511,7 @@ fn prepare_remote_herdr(
     source.cleanup();
     install_result?;
 
-    if !remote_binary_matches(target, &remote_herdr)? {
+    if !remote_binary_matches(target, &remote_herdr, socket_password)? {
         return Err(io::Error::other(format!(
             "installed remote herdr at {}, but it did not report version {}",
             remote_herdr.shell_path,
@@ -520,7 +528,7 @@ fn prepare_remote_herdr(
 }
 
 fn detect_remote_platform(target: &str) -> io::Result<RemotePlatform> {
-    let output = ssh_sh_output(target, "uname -s\nuname -m\n")?;
+    let output = ssh_sh_output(target, "uname -s\nuname -m\n", None)?;
     if !output.status.success() {
         return Err(command_failed("remote platform detection failed", &output));
     }
@@ -563,12 +571,16 @@ fn remote_herdr_from_path_discovery(
     Some(remote_herdr.clone().with_shell_path(shell_quote(path)))
 }
 
-fn remote_binary_matches(target: &str, remote_herdr: &RemoteHerdr) -> io::Result<bool> {
+fn remote_binary_matches(
+    target: &str,
+    remote_herdr: &RemoteHerdr,
+    socket_password: Option<&str>,
+) -> io::Result<bool> {
     let command = format!(
         "test -x {0} && {0} --version && {0} status client --json",
         remote_herdr.shell_path
     );
-    let output = ssh_sh_output(target, &command)?;
+    let output = ssh_sh_output(target, &command, socket_password)?;
     if !output.status.success() {
         return Ok(false);
     }
@@ -585,7 +597,7 @@ fn remote_binary_matches(target: &str, remote_herdr: &RemoteHerdr) -> io::Result
 
 fn remote_binary_exists(target: &str, remote_herdr: &RemoteHerdr) -> io::Result<bool> {
     let command = format!("test -x {}", remote_herdr.shell_path);
-    Ok(ssh_sh_output(target, &command)?.status.success())
+    Ok(ssh_sh_output(target, &command, None)?.status.success())
 }
 
 fn remote_binary_override_path() -> io::Result<Option<PathBuf>> {
@@ -702,8 +714,9 @@ fn ensure_remote_server_ready(
     remote_binary_changed: bool,
     stop_after_install_approved: bool,
     live_handoff_enabled: bool,
+    socket_password: Option<&str>,
 ) -> io::Result<()> {
-    let status = remote_server_status(target, remote_herdr)?;
+    let status = remote_server_status(target, remote_herdr, socket_password)?;
     let RemoteServerStatus::Running {
         version,
         protocol,
@@ -720,7 +733,7 @@ fn ensure_remote_server_ready(
     };
 
     if live_handoff_enabled && live_handoff {
-        match live_handoff_remote_server(target, remote_herdr) {
+        match live_handoff_remote_server(target, remote_herdr, socket_password) {
             Ok(()) => return Ok(()),
             Err(err) => {
                 eprintln!("remote live handoff failed: {err}");
@@ -730,12 +743,12 @@ fn ensure_remote_server_ready(
     }
 
     if stop_after_install_approved {
-        stop_remote_server(target, remote_herdr)?;
+        stop_remote_server(target, remote_herdr, socket_password)?;
         return Ok(());
     }
 
     if confirm_remote_server_stop(target, version.as_deref(), protocol, reason)? {
-        stop_remote_server(target, remote_herdr)?;
+        stop_remote_server(target, remote_herdr, socket_password)?;
     }
     Ok(())
 }
@@ -761,8 +774,9 @@ fn confirm_remote_install_with_running_server(
     target: &str,
     remote_herdr: &RemoteHerdr,
     live_handoff_enabled: bool,
+    socket_password: Option<&str>,
 ) -> io::Result<bool> {
-    let status = match remote_server_status(target, remote_herdr) {
+    let status = match remote_server_status(target, remote_herdr, socket_password) {
         Ok(status) => status,
         Err(err) => {
             if !io::stdin().is_terminal() {
@@ -845,9 +859,10 @@ fn confirm_remote_install_with_running_server(
 fn remote_server_status(
     target: &str,
     remote_herdr: &RemoteHerdr,
+    socket_password: Option<&str>,
 ) -> io::Result<RemoteServerStatus> {
     let command = format!("{} status server --json", remote_herdr.shell_path);
-    let output = ssh_sh_output(target, &command)?;
+    let output = ssh_sh_output(target, &command, socket_password)?;
     if !output.status.success() {
         return Err(command_failed("remote server status failed", &output));
     }
@@ -966,7 +981,11 @@ fn confirm_remote_server_stop(
     Ok(false)
 }
 
-fn live_handoff_remote_server(target: &str, remote_herdr: &RemoteHerdr) -> io::Result<()> {
+fn live_handoff_remote_server(
+    target: &str,
+    remote_herdr: &RemoteHerdr,
+    socket_password: Option<&str>,
+) -> io::Result<()> {
     let command = format!(
         "{} server live-handoff --import-exe {} --expected-protocol {} --expected-version {}",
         remote_herdr.shell_path,
@@ -974,7 +993,7 @@ fn live_handoff_remote_server(target: &str, remote_herdr: &RemoteHerdr) -> io::R
         CURRENT_PROTOCOL,
         current_version()
     );
-    let output = ssh_sh_output(target, &command)?;
+    let output = ssh_sh_output(target, &command, socket_password)?;
     if !output.status.success() {
         return Err(command_failed("remote server live handoff failed", &output));
     }
@@ -985,23 +1004,32 @@ fn live_handoff_remote_server(target: &str, remote_herdr: &RemoteHerdr) -> io::R
     Ok(())
 }
 
-fn stop_remote_server(target: &str, remote_herdr: &RemoteHerdr) -> io::Result<()> {
+fn stop_remote_server(
+    target: &str,
+    remote_herdr: &RemoteHerdr,
+    socket_password: Option<&str>,
+) -> io::Result<()> {
     let command = format!("{} server stop", remote_herdr.shell_path);
-    let output = ssh_sh_output(target, &command)?;
+    let output = ssh_sh_output(target, &command, socket_password)?;
     if !output.status.success() {
         return Err(command_failed("remote server stop failed", &output));
     }
 
-    wait_for_remote_server_shutdown(target, remote_herdr)?;
+    wait_for_remote_server_shutdown(target, remote_herdr, socket_password)?;
     eprintln!("stopped the remote herdr server on {target}; it will restart when the remote client bridge attaches.");
     Ok(())
 }
 
-fn wait_for_remote_server_shutdown(target: &str, remote_herdr: &RemoteHerdr) -> io::Result<()> {
+fn wait_for_remote_server_shutdown(
+    target: &str,
+    remote_herdr: &RemoteHerdr,
+    socket_password: Option<&str>,
+) -> io::Result<()> {
     let deadline = Instant::now() + REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT;
     loop {
-        if remote_server_status(target, remote_herdr)? == RemoteServerStatus::NotRunning {
-            return Ok(());
+        if remote_server_status(target, remote_herdr, socket_password)?
+            == RemoteServerStatus::NotRunning
+        {
         }
         if Instant::now() >= deadline {
             return Err(io::Error::new(
@@ -1270,7 +1298,11 @@ mv "$tmp" "$dest"
     }
 }
 
-fn ssh_sh_output(target: &str, script: &str) -> io::Result<Output> {
+fn ssh_sh_output(
+    target: &str,
+    script: &str,
+    socket_password: Option<&str>,
+) -> io::Result<Output> {
     // Feed POSIX bootstrap scripts to /bin/sh so the user's login shell only
     // has to parse a simple executable invocation.
     let mut child = Command::new("ssh")
@@ -1283,6 +1315,11 @@ fn ssh_sh_output(target: &str, script: &str) -> io::Result<Output> {
         .spawn()?;
 
     let write_result = if let Some(mut stdin) = child.stdin.take() {
+        if let Some(pw) = socket_password {
+            stdin.write_all(
+                format!("export HERDR_SOCKET_PASSWORD={}\n", shell_quote(pw)).as_bytes(),
+            )?;
+        }
         stdin.write_all(script.as_bytes())
     } else {
         Err(io::Error::new(
@@ -1303,8 +1340,17 @@ fn ssh_user_shell_output(target: &str, command: &str) -> io::Result<Output> {
         .output()
 }
 
-fn remote_bridge_command(remote_herdr: &RemoteHerdr, session_name: &str) -> String {
-    let mut command = format!("exec {}", remote_herdr.shell_path);
+fn remote_bridge_command(
+    remote_herdr: &RemoteHerdr,
+    session_name: &str,
+    socket_password: Option<&str>,
+) -> String {
+    let mut command = if let Some(pw) = socket_password {
+        format!("HERDR_SOCKET_PASSWORD={} ", shell_quote(pw))
+    } else {
+        String::new()
+    };
+    command.push_str(&format!("exec {}", remote_herdr.shell_path));
     if session_name != crate::session::DEFAULT_SESSION_NAME {
         command.push_str(" --session ");
         command.push_str(&shell_quote(session_name));
@@ -1376,6 +1422,7 @@ impl SshStdioBridge {
         local_socket: PathBuf,
         session_name: String,
         manage_ssh_config: bool,
+        socket_password: Option<String>,
     ) -> io::Result<Self> {
         let _ = std::fs::remove_file(&local_socket);
         let listener = UnixListener::bind(&local_socket)?;
@@ -1395,6 +1442,7 @@ impl SshStdioBridge {
         let should_stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&should_stop);
         let thread_ssh_config = keepalive_ssh_config.clone();
+        let thread_pw = socket_password.clone();
         let thread = thread::spawn(move || {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
@@ -1411,6 +1459,7 @@ impl SshStdioBridge {
                             &remote_herdr,
                             &session_name,
                             thread_ssh_config.as_deref(),
+                            thread_pw.as_deref(),
                         ) {
                             eprintln!("herdr: remote bridge failed: {err}");
                         }
@@ -1529,6 +1578,7 @@ fn bridge_connection(
     remote_herdr: &RemoteHerdr,
     session_name: &str,
     keepalive_ssh_config: Option<&Path>,
+    socket_password: Option<&str>,
 ) -> io::Result<()> {
     let mut command = Command::new("ssh");
     // Use the generated keepalive ssh config when present; otherwise plain ssh.
@@ -1538,7 +1588,7 @@ fn bridge_connection(
     command
         .arg("-T")
         .arg(target)
-        .arg(remote_bridge_command(remote_herdr, session_name));
+        .arg(remote_bridge_command(remote_herdr, session_name, socket_password));
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1713,6 +1763,7 @@ mod tests {
             socket.clone(),
             "default".to_string(),
             false,
+            None,
         )
         .expect("start bridge listener");
 
@@ -2002,7 +2053,7 @@ mod tests {
             arch: "x86_64",
         });
         assert_eq!(
-            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME, None),
             "exec \"$HOME/.local/bin/herdr\" remote-client-bridge"
         );
     }
@@ -2017,7 +2068,7 @@ mod tests {
             .expect("path binary");
 
         assert_eq!(
-            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME, None),
             "exec /usr/bin/herdr remote-client-bridge"
         );
     }
@@ -2033,7 +2084,7 @@ mod tests {
                 .expect("path binary");
 
         assert_eq!(
-            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME, None),
             "exec '/opt/herdr bin/herdr' remote-client-bridge"
         );
     }
@@ -2049,7 +2100,7 @@ mod tests {
                 .expect("path binary");
 
         assert_eq!(
-            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME, None),
             "exec /opt/homebrew/bin/herdr remote-client-bridge"
         );
         assert_eq!(remote_herdr.platform.asset_key(), "macos-aarch64");
@@ -2066,7 +2117,7 @@ mod tests {
                 .expect("path binary");
 
         assert_eq!(
-            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME, None),
             "exec '/opt/herdr'\\''s/bin/herdr' remote-client-bridge"
         );
     }

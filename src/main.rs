@@ -639,7 +639,7 @@ fn main() -> io::Result<()> {
     }
 
     if let Some(remote_launch) = remote_launch {
-        return remote::run_remote(remote_launch);
+        return remote::run_remote(remote_launch, socket_password);
     }
 
     let loaded_config = config::Config::load();

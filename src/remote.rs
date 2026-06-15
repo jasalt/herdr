@@ -132,7 +132,7 @@ fn validate_remote_target(target: &str) -> Result<&str, String> {
 }
 
 #[cfg(windows)]
-pub(crate) fn run_remote(_remote: RemoteLaunch) -> std::io::Result<()> {
+pub(crate) fn run_remote(_remote: RemoteLaunch, _socket_password: Option<String>) -> std::io::Result<()> {
     debug_assert!(!crate::platform::capabilities().remote_attach);
     Err(std::io::Error::other(
         "remote mode is not supported on Windows yet",
